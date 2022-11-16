@@ -1,449 +1,143 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
-	"fmt"
-	"github.com/anaskhan96/soup"
-	"io/ioutil"
-	"net/http"
+	"github.com/chamzzzzzz/nppa-isbn/isbn"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/robfig/cron/v3"
+	"github.com/urfave/cli/v2"
+	"log"
 	"os"
-	"path"
-	"strings"
+	"time"
 )
-
-type ChannelType string
-
-const (
-	ChannelTypeImportOnlineGame      = "进口网络游戏审批信息"
-	ChannelTypeImportElectronicGame  = "进口电子游戏审批信息"
-	ChannelTypeMadeInChinaOnlineGame = "国产网络游戏审批信息"
-	ChannelTypeChange                = "游戏审批变更信息"
-	ChannelTypeRevoke                = "游戏审批撤销信息"
-)
-
-var ChannelTypeUrlNumber = map[ChannelType]string{
-	ChannelTypeImportOnlineGame:      "318",
-	ChannelTypeImportElectronicGame:  "319",
-	ChannelTypeMadeInChinaOnlineGame: "320",
-	ChannelTypeChange:                "321",
-	ChannelTypeRevoke:                "747",
-}
 
 var (
-	ErrInvalidChannelPageUrl = errors.New("invalid channel page url")
-	ErrInvalidChannelType    = errors.New("invalid channel type")
+	logger = log.New(os.Stdout, "nppa-isbn: ", log.Ldate|log.Lmicroseconds)
 )
 
-type Channel struct {
-	Type     ChannelType
-	Contents map[string]*Content
+type App struct {
+	cli      *cli.App
+	database *isbn.Database
+	tz       string
+	spec     string
 }
 
-type Content struct {
-	ChannelType ChannelType
-	Url         string
-	Id          string
-	Title       string
-	Items       []*Item
-}
-
-type Item struct {
-	ChannelType    ChannelType
-	ContentId      string
-	Seq            string
-	Name           string
-	Type           string
-	Publisher      string
-	Operator       string
-	ApprovalNumber string
-	ISBN           string
-	Time           string
-	ChangeInfo     string
-	RevokeInfo     string
-}
-
-type ISBN struct {
-	Channels map[ChannelType]*Channel
-}
-
-func (content *Content) NewItem() *Item {
-	return &Item{
-		ChannelType: content.ChannelType,
-		ContentId:   content.Id,
+func (app *App) Run() error {
+	app.database = &isbn.Database{}
+	app.cli = &cli.App{
+		Usage: "nppa isbn collector and monitoring",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:        "dn",
+				Value:       "mysql",
+				Usage:       "database driver name",
+				Destination: &app.database.DN,
+			},
+			&cli.StringFlag{
+				Name:        "dsn",
+				Value:       "root:root@/nppa-isbn",
+				Usage:       "database source name",
+				Destination: &app.database.DSN,
+			},
+			&cli.StringFlag{
+				Name:        "spec",
+				Value:       "30 * * * *",
+				Usage:       "cron spec",
+				Destination: &app.spec,
+			},
+			&cli.StringFlag{
+				Name:        "tz",
+				Value:       "Local",
+				Usage:       "time zone",
+				Destination: &app.tz,
+			},
+		},
+		Action: app.run,
 	}
+	return app.cli.Run(os.Args)
 }
 
-func (content *Content) NewAndAppendItem() *Item {
-	return content.AppendItem(content.NewItem())
-}
-
-func (content *Content) AppendItem(item *Item) *Item {
-	content.Items = append(content.Items, item)
-	return item
-}
-
-func NewISBN() *ISBN {
-	isbn := &ISBN{
-		Channels: make(map[ChannelType]*Channel),
+func (app *App) run(c *cli.Context) error {
+	if err := app.database.Migrate(); err != nil {
+		return err
 	}
-
-	isbn.NewChannel(ChannelTypeImportOnlineGame)
-	isbn.NewChannel(ChannelTypeImportElectronicGame)
-	isbn.NewChannel(ChannelTypeMadeInChinaOnlineGame)
-	isbn.NewChannel(ChannelTypeChange)
-	isbn.NewChannel(ChannelTypeRevoke)
-	return isbn
+	logger.Printf("full collecting.")
+	if _, err := app.collect(true); err != nil {
+		return err
+	}
+	logger.Printf("full collecting finished.")
+	return app.cron()
 }
 
-func (isbn *ISBN) NewChannel(channelType ChannelType) *Channel {
-	channel := &Channel{
-		Type:     channelType,
-		Contents: make(map[string]*Content),
-	}
-	isbn.Channels[channel.Type] = channel
-	return channel
-}
-
-func (isbn *ISBN) Get() error {
-	for _, channel := range isbn.Channels {
-		if err := isbn.GetChannel(channel); err != nil {
-			return err
-		}
-	}
+func (app *App) cron() error {
+	logger.Printf("monitoring.")
+	c := cron.New(
+		cron.WithLocation(location(app.tz)),
+		cron.WithLogger(cron.VerbosePrintfLogger(logger)),
+		cron.WithChain(cron.SkipIfStillRunning(cron.VerbosePrintfLogger(logger))),
+	)
+	c.AddFunc(app.spec, app.monitoring)
+	c.Run()
 	return nil
 }
 
-func (isbn *ISBN) SaveToJsonFile(filePath string) error {
-	jsonBytes, err := json.MarshalIndent(isbn, "", "    ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filePath, jsonBytes, 0666)
-}
-
-func (isbn *ISBN) getChannelPageUrl(channel *Channel, page int) string {
-	pageSuffix := ""
-	if page > 1 {
-		pageSuffix = fmt.Sprintf("_%d", page)
-	}
-	return fmt.Sprintf("https://www.nppa.gov.cn/nppa/channels/%s%s.shtml", ChannelTypeUrlNumber[channel.Type], pageSuffix)
-}
-
-func (isbn *ISBN) GetChannelPage(channel *Channel, page int) error {
-	url := isbn.getChannelPageUrl(channel, page)
-	res, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode == http.StatusNotFound {
-		return ErrInvalidChannelPageUrl
+func (app *App) collect(full bool) ([]*isbn.Content, error) {
+	page := 1
+	if full {
+		page = 10
 	}
 
-	html, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-
-	dom := soup.HTMLParse(string(html))
-	if dom.Error != nil {
-		return dom.Error
-	}
-
-	divs := dom.FindAllStrict("div", "class", "ellipsis")
-	for _, div := range divs {
-		a := div.Find("a")
-		href := strings.Trim(a.Attrs()["href"], " ")
-		contentUrl := fmt.Sprintf("https://www.nppa.gov.cn%s", href)
-		contentTitle := strings.Trim(a.Text(), " ")
-		contentId := path.Base(strings.Trim(href, ".shtml"))
-		content := &Content{
-			ChannelType: channel.Type,
-			Url:         contentUrl,
-			Id:          contentId,
-			Title:       contentTitle,
-		}
-		channel.Contents[content.Id] = content
-	}
-	return nil
-}
-
-func (isbn *ISBN) GetChannel(channel *Channel) error {
-	fmt.Println(channel.Type, "获取中...")
-	for page := 1; page < 20; page++ {
-		err := isbn.GetChannelPage(channel, page)
+	var contents []*isbn.Content
+	for _, channelID := range []string{isbn.ChannelImportOnlineGameApprovaled, isbn.ChannelImportElectronicGameApprovaled, isbn.ChannelMadeInChinaOnlineGameApprovaled, isbn.ChannelGameChanged, isbn.ChannelGameRevoked} {
+		channel, err := isbn.GetChannel(channelID, page)
 		if err != nil {
-			if page > 1 && err == ErrInvalidChannelPageUrl {
-				break
+			return contents, err
+		}
+
+		for _, content := range channel.Contents {
+			if has, err := app.database.HasContent(content); err != nil {
+				return contents, err
+			} else if has {
+				continue
 			}
-			return err
-		}
-	}
 
-	for _, content := range channel.Contents {
-		fmt.Println(content.Title, "获取中...")
-		if err := isbn.GetChannelContent(content); err != nil {
-			return err
+			if content, err := isbn.GetContent(content.ChannelID, content.ID); err != nil {
+				return contents, err
+			} else {
+				if err := app.database.AddContent(content); err != nil {
+					return contents, err
+				}
+				contents = append(contents, content)
+			}
 		}
 	}
-	return nil
+	return contents, nil
 }
 
-func (isbn *ISBN) GetChannelContent(content *Content) error {
-	switch content.ChannelType {
-	case ChannelTypeImportOnlineGame:
-		return isbn.GetImportOnlineGameChannelContent(content)
-	case ChannelTypeImportElectronicGame:
-		return isbn.GetImportElectronicGameChannelContent(content)
-	case ChannelTypeMadeInChinaOnlineGame:
-		return isbn.GetMadeInChinaOnlineGameChannelContent(content)
-	case ChannelTypeChange:
-		return isbn.GetChangeChannelContent(content)
-	case ChannelTypeRevoke:
-		return isbn.GetRevokeChannelContent(content)
-	default:
-		return ErrInvalidChannelType
+func (app *App) monitoring() {
+	if contents, err := app.collect(false); err != nil {
+		logger.Printf("monitoring, err='%s'\n", err)
+	} else {
+		if len(contents) > 0 {
+			logger.Printf("monitoring found new isbn content.")
+			app.notification(contents)
+		}
 	}
 }
 
-func (isbn *ISBN) GetImportOnlineGameChannelContent(content *Content) error {
-	res, err := http.Get(content.Url)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	html, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-
-	dom := soup.HTMLParse(string(html))
-	if dom.Error != nil {
-		return dom.Error
-	}
-
-	table := dom.FindStrict("table", "class", "trStyle")
-	if table.Error != nil {
-		return table.Error
-	}
-
-	items := table.FindAll("tr")[1:]
-	for _, item := range items {
-		fields := item.FindAll("td")
-
-		if len(fields) < 7 {
-			continue
-		}
-
-		item := content.NewAndAppendItem()
-		item.Seq = fields[0].Text()
-		item.Name = fields[1].Text()
-		item.Type = fields[2].Text()
-		item.Publisher = fields[3].Text()
-		item.Operator = fields[4].Text()
-		item.ApprovalNumber = fields[5].Text()
-		if len(fields) > 7 {
-			item.ISBN = fields[6].Text()
-			item.Time = fields[7].Text()
-		} else {
-			item.Time = fields[6].Text()
-		}
-	}
-	return nil
+func (app *App) notification(contents []*isbn.Content) {
+	logger.Printf("send notification.")
 }
 
-func (isbn *ISBN) GetImportElectronicGameChannelContent(content *Content) error {
-	res, err := http.Get(content.Url)
-	if err != nil {
-		return err
+func location(tz string) *time.Location {
+	if loc, err := time.LoadLocation(tz); err != nil {
+		return time.Local
+	} else {
+		return loc
 	}
-	defer res.Body.Close()
-
-	html, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-
-	dom := soup.HTMLParse(string(html))
-	if dom.Error != nil {
-		return dom.Error
-	}
-
-	table := dom.FindStrict("table", "class", "trStyle")
-	if table.Error != nil {
-		return table.Error
-	}
-
-	items := table.FindAll("tr")[1:]
-	for _, item := range items {
-		fields := item.FindAll("td")
-
-		if len(fields) != 5 {
-			continue
-		}
-
-		item := content.NewAndAppendItem()
-		item.Seq = fields[0].Text()
-		item.Name = fields[1].Text()
-		item.Publisher = fields[2].Text()
-		item.ApprovalNumber = fields[3].Text()
-		item.Time = fields[4].Text()
-	}
-	return nil
-}
-
-func (isbn *ISBN) GetMadeInChinaOnlineGameChannelContent(content *Content) error {
-	res, err := http.Get(content.Url)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	html, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-
-	dom := soup.HTMLParse(string(html))
-	if dom.Error != nil {
-		return dom.Error
-	}
-
-	table := dom.FindStrict("table", "class", "trStyle tableNormal")
-	if table.Error != nil {
-		return table.Error
-	}
-
-	items := table.FindAll("tr", "class", "item")
-	for _, item := range items {
-		fields := item.FindAll("td")
-
-		if len(fields) < 7 {
-			continue
-		}
-
-		item := content.NewAndAppendItem()
-		item.Seq = fields[0].Text()
-		item.Name = fields[1].Text()
-		item.Type = fields[2].Text()
-		item.Publisher = fields[3].Text()
-		item.Operator = fields[4].Text()
-		item.ApprovalNumber = fields[5].Text()
-		if len(fields) > 7 {
-			item.ISBN = fields[6].Text()
-			item.Time = fields[7].Text()
-		} else {
-			item.Time = fields[6].Text()
-		}
-	}
-	return nil
-}
-
-func (isbn *ISBN) GetChangeChannelContent(content *Content) error {
-	res, err := http.Get(content.Url)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	html, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-
-	dom := soup.HTMLParse(string(html))
-	if dom.Error != nil {
-		return dom.Error
-	}
-
-	table := dom.FindStrict("table", "class", "trStyle")
-	if table.Error != nil {
-		return table.Error
-	}
-
-	items := table.FindAll("tr")[1:]
-	for _, item := range items {
-		fields := item.FindAll("td")
-
-		if len(fields) < 8 {
-			continue
-		}
-
-		item := content.NewAndAppendItem()
-		item.Seq = fields[0].Text()
-		item.Name = fields[1].Text()
-		item.Type = fields[2].Text()
-		item.Publisher = fields[3].Text()
-		item.Operator = fields[4].Text()
-		item.ChangeInfo = fields[5].Text()
-		item.ApprovalNumber = fields[6].Text()
-		if len(fields) > 8 {
-			item.ISBN = fields[7].Text()
-			item.Time = fields[8].Text()
-		} else {
-			item.Time = fields[7].Text()
-		}
-	}
-	return nil
-}
-
-func (isbn *ISBN) GetRevokeChannelContent(content *Content) error {
-	res, err := http.Get(content.Url)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-
-	html, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}
-
-	dom := soup.HTMLParse(string(html))
-	if dom.Error != nil {
-		return dom.Error
-	}
-
-	table := dom.FindStrict("table", "class", "trStyle")
-	if table.Error != nil {
-		return table.Error
-	}
-
-	items := table.FindAll("tr")[1:]
-	for _, item := range items {
-		fields := item.FindAll("td")
-
-		if len(fields) != 9 {
-			continue
-		}
-
-		item := content.NewAndAppendItem()
-		item.Seq = fields[0].Text()
-		item.Name = fields[1].Text()
-		item.Type = fields[2].Text()
-		item.Publisher = fields[3].Text()
-		item.Operator = fields[4].Text()
-		item.RevokeInfo = fields[5].Text()
-		item.ApprovalNumber = fields[6].Text()
-		item.ISBN = fields[7].Text()
-		item.Time = fields[8].Text()
-	}
-	return nil
 }
 
 func main() {
-	isbn := NewISBN()
-
-	if err := isbn.Get(); err != nil {
-		fmt.Println("get error:", err)
-		os.Exit(1)
-	}
-
-	if err := isbn.SaveToJsonFile("isbn.json"); err != nil {
-		fmt.Println("save to json file error:", err)
-		os.Exit(1)
+	if err := (&App{}).Run(); err != nil {
+		logger.Printf("run, err='%s'\n", err)
 	}
 }
