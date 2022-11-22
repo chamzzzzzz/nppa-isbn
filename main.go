@@ -17,6 +17,7 @@ var (
 type App struct {
 	cli      *cli.App
 	database *isbn.Database
+	full     bool
 	tz       string
 	spec     string
 }
@@ -37,6 +38,12 @@ func (app *App) Run() error {
 				Value:       "root:root@/nppa-isbn",
 				Usage:       "database source name",
 				Destination: &app.database.DSN,
+			},
+			&cli.BoolFlag{
+				Name:        "full",
+				Value:       false,
+				Usage:       "full collect",
+				Destination: &app.full,
 			},
 			&cli.StringFlag{
 				Name:        "spec",
@@ -60,11 +67,13 @@ func (app *App) run(c *cli.Context) error {
 	if err := app.database.Migrate(); err != nil {
 		return err
 	}
-	logger.Printf("full collecting.")
-	if _, err := app.collect(true); err != nil {
-		return err
+	if app.full {
+		logger.Printf("full collecting.")
+		if _, err := app.collect(true); err != nil {
+			return err
+		}
+		logger.Printf("full collecting finished.")
 	}
-	logger.Printf("full collecting finished.")
 	return app.cron()
 }
 
