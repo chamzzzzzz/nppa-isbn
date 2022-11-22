@@ -62,6 +62,10 @@ func (database *Database) HasContent(content *Content) (bool, error) {
 }
 
 func (database *Database) AddContent(content *Content) error {
+	if len(content.Items) == 0 {
+		return nil
+	}
+
 	db, err := database.getdb()
 	if err != nil {
 		return err
