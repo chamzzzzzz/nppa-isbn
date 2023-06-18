@@ -1,50 +1,54 @@
 package isbn
 
 import (
+	"bytes"
 	"fmt"
-	"github.com/anaskhan96/soup"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"path"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/chamzzzzzz/supersimplesoup"
 )
 
 const (
-	ChannelImportOnlineGameApprovaled      = "318"
-	ChannelImportElectronicGameApprovaled  = "319"
-	ChannelMadeInChinaOnlineGameApprovaled = "320"
-	ChannelGameChanged                     = "321"
-	ChannelGameRevoked                     = "747"
+	ChannelImportOnlineGameApprovaled      = "jkwlyxspxx"
+	ChannelImportElectronicGameApprovaled  = "jkdzyxspxx"
+	ChannelMadeInChinaOnlineGameApprovaled = "gcwlyxspxx"
+	ChannelGameChanged                     = "yxspbgxx"
+	ChannelGameRevoked                     = "yxspcxxx"
 )
 
-type Channel struct {
-	ID       string
-	Contents []*Content
-}
+var (
+	ChannelChineseNames = map[string]string{
+		ChannelImportOnlineGameApprovaled:      "进口网络游戏审批信息",
+		ChannelImportElectronicGameApprovaled:  "进口电子游戏审批信息",
+		ChannelMadeInChinaOnlineGameApprovaled: "国产网络游戏审批信息",
+		ChannelGameChanged:                     "游戏审批变更信息",
+		ChannelGameRevoked:                     "游戏审批撤销信息",
+	}
+	re = regexp.MustCompile("var _sblb = '(.*)';")
+)
 
 type Content struct {
-	ChannelID string
-	ID        string
-	Title     string
-	URL       string
-	Date      string
-	Items     []*Item
+	Title string  `json:"title"`
+	URL   string  `json:"url"`
+	Date  string  `json:"date"`
+	Items []*Item `json:"items"`
 }
 
 type Item struct {
-	ChannelID      string
-	ContentID      string
-	Seq            string
-	Name           string
-	Catalog        string
-	Publisher      string
-	Operator       string
-	ApprovalNumber string
-	ISBN           string
-	Date           string
-	ChangeInfo     string
-	RevokeInfo     string
+	Seq            string `json:"seq"`
+	Name           string `json:"name"`
+	Catalog        string `json:"catalog,omitempty"`
+	Publisher      string `json:"publisher,omitempty"`
+	Operator       string `json:"operator,omitempty"`
+	ApprovalNumber string `json:"approvalNumber,omitempty"`
+	ISBN           string `json:"isbn,omitempty"`
+	Date           string `json:"date,omitempty"`
+	ChangeInfo     string `json:"changeInfo,omitempty"`
+	RevokeInfo     string `json:"revokeInfo,omitempty"`
 }
 
 func GetHTML(url string, retries int) ([]byte, error) {
@@ -60,7 +64,7 @@ func GetHTML(url string, retries int) ([]byte, error) {
 			continue
 		}
 
-		html, err := ioutil.ReadAll(res.Body)
+		html, err := io.ReadAll(res.Body)
 		if err != nil {
 			return nil, err
 		}
@@ -69,136 +73,131 @@ func GetHTML(url string, retries int) ([]byte, error) {
 	return nil, fmt.Errorf("bad gateway")
 }
 
-func GetDOM(url string) (soup.Root, error) {
+func GetDOM(url string) (*supersimplesoup.Node, error) {
 	html, err := GetHTML(url, 10)
 	if err != nil {
-		return soup.Root{}, err
+		return nil, err
 	}
-	dom := soup.HTMLParse(string(html))
-	if dom.Error != nil {
-		return soup.Root{}, dom.Error
+	dom, err := supersimplesoup.Parse(bytes.NewReader(html))
+	if err != nil {
+		return nil, err
 	}
 	return dom, nil
 }
 
-func GetChannel(channelID string, page int) (*Channel, error) {
-	channel := &Channel{ID: channelID}
-	for i := 1; i <= page; i++ {
-		suffix := ""
-		if i > 1 {
-			suffix = fmt.Sprintf("_%d", i)
-		}
-		url := fmt.Sprintf("https://www.nppa.gov.cn/nppa/channels/%s%s.shtml", channelID, suffix)
-
-		dom, err := GetDOM(url)
-		if err != nil {
-			return nil, err
-		}
-
-		div := dom.FindStrict("div", "class", "g-font-size-140 g-font-size-100--2xs g-line-height-1 g-mb-10")
-		if div.Error == nil && strings.TrimSpace(div.Text()) == "404" {
-			break
-		}
-
-		for _, div := range dom.FindAllStrict("div", "class", "ellipsis") {
-			a := div.Find("a")
-			if a.Error != nil {
-				return nil, a.Error
-			}
-			span := div.FindNextSibling()
-			if span.Error != nil {
-				return nil, span.Error
-			}
-
-			href := strings.TrimSpace(a.Attrs()["href"])
-			content := &Content{
-				ChannelID: channelID,
-				ID:        path.Base(strings.Trim(href, ".shtml")),
-				Title:     strings.TrimSpace(a.Text()),
-				URL:       fmt.Sprintf("https://www.nppa.gov.cn%s", href),
-			}
-			channel.Contents = append(channel.Contents, content)
-		}
+func GetPageContents(page int, getItem bool) ([]*Content, error) {
+	var contents []*Content
+	suffix := ""
+	if page > 0 {
+		suffix = fmt.Sprintf("_%d", page)
 	}
-	return channel, nil
-}
 
-func GetContent(channelID, contentID string) (*Content, error) {
-	content := &Content{
-		ChannelID: channelID,
-		ID:        contentID,
-		URL:       fmt.Sprintf("https://www.nppa.gov.cn/nppa/contents/%s/%s.shtml", channelID, contentID),
-	}
-	dom, err := GetDOM(content.URL)
+	url := fmt.Sprintf("https://www.nppa.gov.cn/bsfw/jggs/yxspjg/index%s.html", suffix)
+	dom, err := GetDOM(url)
 	if err != nil {
 		return nil, err
 	}
 
-	h2 := dom.FindStrict("h2", "class", "m3page_t")
-	if h2.Error != nil {
-		return nil, h2.Error
+	div, err := dom.Find("div", "class", "g-font-size-140 g-font-size-100--2xs g-line-height-1 g-mb-10")
+	if err == nil && strings.TrimSpace(div.Text()) == "404" {
+		return nil, fmt.Errorf("404")
 	}
-	content.Title = strings.TrimSpace(h2.Text())
 
-	span := dom.FindStrict("span", "class", "m3pageFun_s1")
-	if span.Error != nil {
-		return nil, span.Error
-	}
-	content.Date = strings.TrimSpace(span.Text())
+	for _, div := range dom.QueryAll("div", "class", "ellipsis") {
+		a, err := div.Find("a")
+		if err != nil {
+			return nil, err
+		}
+		span, err := div.ParentNode().Find("span")
+		if err != nil {
+			return nil, err
+		}
 
-	style := "trStyle"
-	if channelID == ChannelMadeInChinaOnlineGameApprovaled {
-		style = "trStyle tableNormal"
+		content := &Content{
+			Title: strings.TrimSpace(a.Text()),
+			URL:   strings.TrimPrefix(strings.TrimSpace(a.Href()), "./"),
+			Date:  strings.Trim(strings.TrimSpace(span.Text()), "[]"),
+		}
+		if getItem {
+			if err := content.GetItems(); err != nil {
+				return nil, err
+			}
+		}
+		contents = append(contents, content)
 	}
-	table := dom.FindStrict("table", "class", style)
-	if table.Error != nil {
-		return nil, table.Error
+	return contents, nil
+}
+
+func (c *Content) GetChannel() string {
+	f := strings.Split(c.URL, "/")
+	if len(f) != 3 {
+		return ""
 	}
-	for _, tr := range table.FindAll("tr")[1:] {
-		td := tr.FindAll("td")
-		item := &Item{ChannelID: channelID, ContentID: contentID}
+	return f[0]
+}
+
+func (c *Content) GetChannelChineseName() string {
+	return ChannelChineseNames[c.GetChannel()]
+}
+
+func (c *Content) GetItems() error {
+	url := "https://www.nppa.gov.cn/bsfw/jggs/yxspjg/" + c.URL
+	dom, err := GetDOM(url)
+	if err != nil {
+		return err
+	}
+
+	table, err := dom.Find("table", "class", "trStyle tableOrder")
+	if err != nil {
+		return err
+	}
+
+	channel := c.GetChannel()
+	var items []*Item
+	for _, tr := range table.QueryAll("tr")[1:] {
+		td := tr.QueryAll("td")
+		item := &Item{}
 		item.Seq = strings.TrimSpace(td[0].Text())
 		item.Name = strings.TrimSpace(td[1].Text())
-		switch channelID {
+		switch channel {
 		case ChannelImportElectronicGameApprovaled:
 			if len(td) != 5 {
-				return nil, fmt.Errorf("item field len error")
+				return fmt.Errorf("item field len error")
 			}
 			item.Publisher = td[2].Text()
 			item.ApprovalNumber = td[3].Text()
 			item.Date = td[4].Text()
 		case ChannelImportOnlineGameApprovaled, ChannelMadeInChinaOnlineGameApprovaled:
-			if len(td) < 7 {
-				return nil, fmt.Errorf("item field len error")
+			if len(td) != 7 {
+				return fmt.Errorf("item field len error")
 			}
-			item.Catalog = strings.TrimSpace(td[2].Text())
-			item.Publisher = strings.TrimSpace(td[3].Text())
-			item.Operator = strings.TrimSpace(td[4].Text())
-			item.ApprovalNumber = strings.TrimSpace(td[5].Text())
-			if len(td) > 7 {
-				item.ISBN = strings.TrimSpace(td[6].Text())
-				item.Date = strings.TrimSpace(td[7].Text())
-			} else {
-				item.Date = strings.TrimSpace(td[6].Text())
+			script, err := tr.Find("script")
+			if err != nil {
+				return err
 			}
+			item.Publisher = strings.TrimSpace(td[2].Text())
+			item.Operator = strings.TrimSpace(td[3].Text())
+			item.ApprovalNumber = strings.TrimSpace(td[4].Text())
+			item.ISBN = strings.TrimSpace(td[5].Text())
+			item.Date = strings.TrimSpace(td[6].Text())
+			matches := re.FindStringSubmatch(strings.ReplaceAll(script.Text(), "\n", ""))
+			if len(matches) != 2 {
+				return fmt.Errorf("catalog not found")
+			}
+			item.Catalog = matches[1]
 		case ChannelGameChanged:
-			if len(td) < 8 {
-				return nil, fmt.Errorf("item field len error")
+			if len(td) != 8 {
+				return fmt.Errorf("item field len error")
 			}
 			item.Catalog = strings.TrimSpace(td[2].Text())
 			item.Publisher = strings.TrimSpace(td[3].Text())
 			item.Operator = strings.TrimSpace(td[4].Text())
 			item.ChangeInfo = strings.TrimSpace(td[5].Text())
 			item.ApprovalNumber = strings.TrimSpace(td[6].Text())
-			if len(td) > 8 {
-				item.ISBN = strings.TrimSpace(td[7].Text())
-				item.Date = strings.TrimSpace(td[8].Text())
-			} else {
-				item.Date = strings.TrimSpace(td[7].Text())
-			}
+			item.Date = strings.TrimSpace(td[7].Text())
 		case ChannelGameRevoked:
 			if len(td) != 9 {
-				return nil, fmt.Errorf("item field len error")
+				return fmt.Errorf("item field len error")
 			}
 			item.Catalog = strings.TrimSpace(td[2].Text())
 			item.Publisher = strings.TrimSpace(td[3].Text())
@@ -208,7 +207,8 @@ func GetContent(channelID, contentID string) (*Content, error) {
 			item.ISBN = strings.TrimSpace(td[7].Text())
 			item.Date = strings.TrimSpace(td[8].Text())
 		}
-		content.Items = append(content.Items, item)
+		items = append(items, item)
 	}
-	return content, nil
+	c.Items = items
+	return nil
 }
