@@ -79,7 +79,7 @@ func check(begin, end int, d time.Duration) {
 	b := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), begin, 0, 0, 0, time.Local)
 	e := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), end, 0, 0, 0, time.Local)
 	log.Printf("start check at %s", start.Format("2006-01-02 15:04:05"))
-	log.Printf("checking from [%v] to [%v] every %v.", b.Format(time.TimeOnly), e.Format(time.TimeOnly), d)
+	log.Printf("checking from [%v] to [%v] every %v.", b.Format("15:04:05"), e.Format("15:04:05"), d)
 	count := 0
 	for {
 		now := time.Now()
