@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"mime"
@@ -10,123 +11,98 @@ import (
 	"net/smtp"
 	"os"
 	"text/template"
-	"time"
 
 	"github.com/chamzzzzzz/nppa-isbn/isbn"
 )
 
 var (
-	latest []*isbn.Content
-	addr   = os.Getenv("ISBN_SMTP_ADDR")
-	user   = os.Getenv("ISBN_SMTP_USER")
-	pass   = os.Getenv("ISBN_SMTP_PASS")
-	source = "From: {{.From}}\r\nTo: {{.To}}\r\nSubject: {{.Subject}}\r\n\r\n{{.Body}}"
-	t      *template.Template
+	addr = os.Getenv("ISBN_SMTP_ADDR")
+	user = os.Getenv("ISBN_SMTP_USER")
+	pass = os.Getenv("ISBN_SMTP_PASS")
+	t    = template.Must(template.New("isbn").Parse("From: {{.From}}\r\nTo: {{.To}}\r\nSubject: {{.Subject}}\r\n\r\n{{.Body}}"))
 )
 
 func main() {
-	funcs := template.FuncMap{
-		"bencoding": mime.BEncoding.Encode,
-	}
-	t = template.Must(template.New("mail").Funcs(funcs).Parse(source))
+	var full bool
+	flag.BoolVar(&full, "full", false, "full archive")
+	flag.StringVar(&addr, "addr", addr, "notification smtp addr")
+	flag.StringVar(&user, "user", user, "notification smtp user")
+	flag.StringVar(&pass, "pass", pass, "notification smtp pass")
+	flag.Parse()
 
-	contents, err := isbn.GetPageContents(0, false)
-	if err != nil {
-		log.Fatalf("get latest contents fail. err='%s'", err)
-	}
-	if len(contents) == 0 {
-		log.Fatalf("get latest contents fail, contents is empty")
-	}
-	log.Printf("get latest contents success. count=%d", len(contents))
-	latest = contents
-
-	begin, end := 10, 20
-	for {
-		now := time.Now()
-		next := calc(now, begin, end)
-		log.Printf("next check at %s", next.Format("2006-01-02 15:04:05"))
-		time.Sleep(next.Sub(now))
-		check(begin, end, 10*time.Minute)
-	}
-}
-
-func calc(now time.Time, begin, end int) time.Time {
-	t := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
-	days := 1
-	d := time.Duration(begin) * time.Hour
-	w := now.Weekday()
-	if w == time.Sunday {
-		days = 1
-	} else if w == time.Saturday {
-		days = 2
+	page := 1
+	if full {
+		page = 30
+		log.Printf("full archive. page=%d", page)
 	} else {
-		if now.Hour() < begin {
-			days = 0
-		} else if now.Hour() >= begin && now.Hour() <= end {
-			days = 0
-			d = now.Add(1 * time.Second).Sub(t)
-		} else {
-			if w == time.Friday {
-				days = 3
-			}
-		}
+		log.Printf("increment archive. page=%d", page)
 	}
-	return t.AddDate(0, 0, days).Add(d)
-}
 
-func check(begin, end int, d time.Duration) {
-	start := time.Now()
-	b := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), begin, 0, 0, 0, time.Local)
-	e := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), end, 0, 0, 0, time.Local)
-	log.Printf("start check at %s", start.Format("2006-01-02 15:04:05"))
-	log.Printf("checking from [%v] to [%v] every %v.", b.Format("15:04:05"), e.Format("15:04:05"), d)
-	count := 0
-	for {
-		now := time.Now()
-		if now.Hour() < begin || now.Hour() > end {
-			break
-		}
-		count++
-		contents, err := diff()
+	var bn []*isbn.Content
+	for i := 0; i < page; i++ {
+		contents, err := isbn.GetPageContents(i, false)
 		if err != nil {
-			log.Printf("check fail, diff error. err='%s'", err)
-		}
-		if len(contents) > 0 {
-			notification(contents)
-			snapshot()
-		}
-		time.Sleep(d)
-	}
-	log.Printf("finish check at %s. used=%v, count=%d", time.Now().Format("2006-01-02 15:04:05"), time.Since(start), count)
-}
-
-func diff() ([]*isbn.Content, error) {
-	contents, err := isbn.GetPageContents(0, false)
-	if err != nil {
-		return nil, err
-	}
-	if len(contents) == 0 {
-		return nil, fmt.Errorf("get contents is empty")
-	}
-
-	var newest []*isbn.Content
-	for _, content := range contents {
-		var exist bool
-		for _, l := range latest {
-			if content.URL == l.URL {
-				exist = true
+			if err.Error() == "404" {
 				break
 			}
+			log.Printf("get page contents fail. page=%d, err='%s'", i, err)
+			return
 		}
-		if !exist {
-			content.GetItems()
-			newest = append(newest, content)
+		log.Printf("get page contents success. page=%d, contents=%d", i, len(contents))
+		bn = append(bn, contents...)
+	}
+	log.Printf("get contents success. contents=%d", len(bn))
+
+	var newbn []*isbn.Content
+	for _, content := range bn {
+		p := fmt.Sprintf("data/%s.json", content.Title)
+		_, err := os.Stat(p)
+		if err == nil {
+			log.Printf("skip archived content. title=%s, path=%s", content.Title, p)
+			continue
+		}
+		if !os.IsNotExist(err) {
+			log.Printf("stat content fail. title=%s, path=%s, err='%s'", content.Title, p, err)
+			return
+		}
+		if err = content.GetItems(); err != nil {
+			log.Printf("get content items fail. title=%s, err='%s'", content.Title, err)
+			return
+		}
+		if len(content.Items) == 0 {
+			log.Printf("skip empty content. title=%s", content.Title)
+			continue
+		}
+		log.Printf("get content items success. title=%s, items=%d", content.Title, len(content.Items))
+		newbn = append(newbn, content)
+	}
+
+	err := os.MkdirAll("data", 0755)
+	if err != nil {
+		if !os.IsExist(err) {
+			log.Printf("mkdir data fail. err='%s'", err)
+			return
 		}
 	}
-	if len(newest) > 0 {
-		latest = contents
+
+	for _, content := range newbn {
+		p := fmt.Sprintf("data/%s.json", content.Title)
+		b, err := json.MarshalIndent(content, "", "  ")
+		if err != nil {
+			log.Printf("marshal content fail. title=%s, err='%s'", content.Title, err)
+			return
+		}
+		err = os.WriteFile(p, b, 0644)
+		if err != nil {
+			log.Printf("write content fail. title=%s, err='%s'", content.Title, err)
+			return
+		}
+		log.Printf("write content success. title=%s, path=%s", content.Title, p)
 	}
-	return newest, nil
+
+	if !full && len(newbn) > 0 {
+		notification(newbn)
+	}
 }
 
 func notification(contents []*isbn.Content) {
@@ -174,33 +150,4 @@ func notification(contents []*isbn.Content) {
 		log.Printf("send notification fail. err='%s'\n", err)
 	}
 	log.Printf("send notification success.\n")
-}
-
-func snapshot() error {
-	log.Printf("snapshot...")
-	var bn []*isbn.Content
-	for i := 0; i < 30; i++ {
-		contents, err := isbn.GetPageContents(i, true)
-		if err != nil {
-			if err.Error() == "404" {
-				break
-			}
-			log.Printf("snapshot fail, get page contents error. page=%d, err='%s'", i, err)
-			return err
-		}
-		bn = append(bn, contents...)
-	}
-	b, err := json.MarshalIndent(bn, "", "  ")
-	if err != nil {
-		log.Printf("snapshot fail, marshal error. err='%s'", err)
-		return err
-	}
-	file := fmt.Sprintf("isbn-snapshot-%s.json", time.Now().Format("20060102150405"))
-	err = os.WriteFile(file, b, 0644)
-	if err != nil {
-		log.Printf("snapshot fail, write file error. err='%s'", err)
-		return err
-	}
-	log.Printf("snapshot success. file=%s", file)
-	return nil
 }
