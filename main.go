@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/smtp"
 	"os"
+	"strings"
 	"text/template"
+	"time"
 
 	"github.com/chamzzzzzz/nppa-isbn/isbn"
 )
@@ -55,13 +57,21 @@ func main() {
 
 	var newbn []*isbn.Content
 	for _, content := range bn {
+		c := &isbn.Content{
+			Title: content.Title,
+			URL:   content.URL,
+		}
 		p := fmt.Sprintf("data/%s.json", content.Title)
 		_, err := os.Stat(p)
 		if err == nil {
-			log.Printf("skip archived content. title=%s, path=%s", content.Title, p)
-			continue
-		}
-		if !os.IsNotExist(err) {
+			if skip, err := shouldSkip(p, c); err != nil {
+				log.Printf("should skip content fail. title=%s, path=%s, err='%s'", content.Title, p, err)
+				return
+			} else if skip {
+				log.Printf("skip archived content. title=%s, path=%s", content.Title, p)
+				continue
+			}
+		} else if !os.IsNotExist(err) {
 			log.Printf("stat content fail. title=%s, path=%s, err='%s'", content.Title, p, err)
 			return
 		}
@@ -71,6 +81,10 @@ func main() {
 		}
 		if len(content.Items) == 0 {
 			log.Printf("skip empty content. title=%s", content.Title)
+			continue
+		}
+		if !diff(c, content) {
+			log.Printf("skip same content. title=%s", content.Title)
 			continue
 		}
 		log.Printf("get content items success. title=%s, items=%d", content.Title, len(content.Items))
@@ -103,6 +117,37 @@ func main() {
 	if !full && len(newbn) > 0 {
 		notification(newbn)
 	}
+}
+
+func shouldSkip(p string, content *isbn.Content) (bool, error) {
+	channel := content.GetChannel()
+	if channel == isbn.ChannelMadeInChinaOnlineGameApprovaled {
+		return true, nil
+	}
+	year := fmt.Sprintf("%d", time.Now().Year())
+	if !strings.Contains(content.Title, year) {
+		return true, nil
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return true, err
+	}
+	if err = json.Unmarshal(b, content); err != nil {
+		return true, err
+	}
+	return false, nil
+}
+
+func diff(o, n *isbn.Content) bool {
+	if len(o.Items) != len(n.Items) {
+		return true
+	}
+	for i := 0; i < len(o.Items); i++ {
+		if *o.Items[i] != *n.Items[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func notification(contents []*isbn.Content) {
