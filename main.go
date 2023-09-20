@@ -21,7 +21,7 @@ var (
 	addr = os.Getenv("ISBN_SMTP_ADDR")
 	user = os.Getenv("ISBN_SMTP_USER")
 	pass = os.Getenv("ISBN_SMTP_PASS")
-	t    = template.Must(template.New("isbn").Parse("From: {{.From}}\r\nTo: {{.To}}\r\nSubject: {{.Subject}}\r\n\r\n{{.Body}}"))
+	t    = template.Must(template.New("isbn").Parse("From: {{.From}}\r\nTo: {{.To}}\r\nSubject: {{.Subject}}\r\nContent-Type: {{.ContentType}}\r\n\r\n{{.Body}}"))
 )
 
 func main() {
@@ -152,11 +152,12 @@ func diff(o, n *isbn.Content) bool {
 
 func notification(contents []*isbn.Content) {
 	type Data struct {
-		From     string
-		To       string
-		Subject  string
-		Body     string
-		Contents []*isbn.Content
+		From        string
+		To          string
+		Subject     string
+		ContentType string
+		Body        string
+		Contents    []*isbn.Content
 	}
 
 	log.Printf("sending notification...")
@@ -177,11 +178,12 @@ func notification(contents []*isbn.Content) {
 	}
 
 	data := Data{
-		From:     fmt.Sprintf("%s <%s>", mime.BEncoding.Encode("UTF-8", "Monitor"), user),
-		To:       user,
-		Subject:  mime.BEncoding.Encode("UTF-8", fmt.Sprintf("「ISBN」%s", subject)),
-		Body:     body,
-		Contents: contents,
+		From:        fmt.Sprintf("%s <%s>", mime.BEncoding.Encode("UTF-8", "Monitor"), user),
+		To:          user,
+		Subject:     mime.BEncoding.Encode("UTF-8", fmt.Sprintf("「ISBN」%s", subject)),
+		ContentType: "text/plain; charset=utf-8",
+		Body:        body,
+		Contents:    contents,
 	}
 
 	var buf bytes.Buffer
