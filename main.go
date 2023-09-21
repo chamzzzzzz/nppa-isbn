@@ -21,6 +21,7 @@ var (
 	addr = os.Getenv("ISBN_SMTP_ADDR")
 	user = os.Getenv("ISBN_SMTP_USER")
 	pass = os.Getenv("ISBN_SMTP_PASS")
+	to   = os.Getenv("ISBN_SMTP_TO")
 	t    = template.Must(template.New("isbn").Parse("From: {{.From}}\r\nTo: {{.To}}\r\nSubject: {{.Subject}}\r\nContent-Type: {{.ContentType}}\r\n\r\n{{.Body}}"))
 )
 
@@ -30,6 +31,7 @@ func main() {
 	flag.StringVar(&addr, "addr", addr, "notification smtp addr")
 	flag.StringVar(&user, "user", user, "notification smtp user")
 	flag.StringVar(&pass, "pass", pass, "notification smtp pass")
+	flag.StringVar(&to, "to", to, "notification smtp to")
 	flag.Parse()
 
 	page := 1
@@ -179,7 +181,7 @@ func notification(contents []*isbn.Content) {
 
 	data := Data{
 		From:        fmt.Sprintf("%s <%s>", mime.BEncoding.Encode("UTF-8", "Monitor"), user),
-		To:          user,
+		To:          to,
 		Subject:     mime.BEncoding.Encode("UTF-8", fmt.Sprintf("「ISBN」%s", subject)),
 		ContentType: "text/plain; charset=utf-8",
 		Body:        body,
@@ -193,8 +195,9 @@ func notification(contents []*isbn.Content) {
 	}
 
 	auth := smtp.PlainAuth("", user, pass, host)
-	if err := smtp.SendMail(addr, auth, user, []string{user}, buf.Bytes()); err != nil {
+	if err := smtp.SendMail(addr, auth, user, strings.Split(to, ","), buf.Bytes()); err != nil {
 		log.Printf("send notification fail. err='%s'\n", err)
+		return
 	}
 	log.Printf("send notification success.\n")
 }
